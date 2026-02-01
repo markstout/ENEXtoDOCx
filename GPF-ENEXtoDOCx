@@ -1,0 +1,727 @@
+# GPF-ENEXtoDOCX - part of the Quick Notes Suite
+# Copyright 2025 Mark A. Stout
+# Licensed using the MIT License
+
+import sys
+import os
+import json
+import webbrowser
+import xml.etree.ElementTree as ET
+from datetime import datetime
+import base64
+import mimetypes
+import urllib.parse
+import urllib.request
+import re
+import hashlib
+
+from PySide6.QtCore import (Qt, QObject, QThread, Signal)
+from PySide6.QtGui import (QAction, QIcon)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QLineEdit, QPushButton, QComboBox, QProgressBar, QMessageBox,
+    QFileDialog
+)
+
+from bs4 import BeautifulSoup
+from docx import Document
+from docx.shared import Inches
+from docx.opc.constants import RELATIONSHIP_TYPE
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+# --- Dependencies ---
+# Pillow is required: pip install Pillow
+# lxml is recommended for XML parsing: pip install lxml
+try:
+    from PIL import Image, UnidentifiedImageError
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
+
+# --- Global App Constants ---
+APP_NAME = "GPF-ENEXtoDOCX"
+APP_COPYRIGHT = "Copyright 2026 Mark A. Stout"
+APP_DOCUMENTATION_LINK = "https://sites.google.com/view/getproductivefast/enextodocx-converter/documentation?authuser=0" # URL to documentation, if available
+APP_VERSION = "0.5"
+
+# --- Asset Paths ---
+# Assumes the icon is in the same folder as the script
+try:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    SCRIPT_DIR = os.getcwd() # Fallback for environments where __file__ is not defined
+ICON_PATH = os.path.join(SCRIPT_DIR, "app_icon.ico")
+
+
+# --- Configuration ---
+MEDIA_FOLDER_NAME = "media"
+
+
+# --- Worker for Threading ---
+class ConversionWorker(QObject):
+    """
+    Runs the conversion process in a separate thread to keep the GUI responsive.
+    """
+    notebook_start = Signal(str, int)
+    note_progress = Signal(str)
+    index_creation = Signal(str)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, source_dir, dest_dir, notebook_filter, quick_notes_suite_url):
+        super().__init__()
+        self.source_dir = source_dir
+        self.dest_dir = dest_dir
+        self.notebook_filter = notebook_filter
+        self.quick_notes_suite_url = quick_notes_suite_url
+        self.error_log = []
+
+    def run(self):
+        """Main conversion logic."""
+        try:
+            start_time = datetime.now()
+            total_notes_processed = 0
+            summary_data = []
+
+            enex_files = [f for f in os.listdir(self.source_dir) if f.endswith(".enex")]
+            if self.notebook_filter:
+                enex_files = [f for f in enex_files if os.path.splitext(f)[0] == self.notebook_filter]
+
+            for filename in enex_files:
+                notebook_name = os.path.splitext(filename)[0]
+                filepath = os.path.join(self.source_dir, filename)
+
+                try:
+                    tree = ET.parse(filepath)
+                    root = tree.getroot()
+                except ET.ParseError as e:
+                    self.error_log.append(f"FAILED to parse XML for {notebook_name}. Error: {e}")
+                    continue
+                
+                notes = root.findall("note")
+                self.notebook_start.emit(notebook_name, len(notes))
+                
+                notebook_dir = os.path.join(self.dest_dir, notebook_name)
+                os.makedirs(notebook_dir, exist_ok=True)
+                notebook_attachments_index = {}
+                count = 0
+
+                for idx, note in enumerate(notes, 1):
+                    title = note.findtext('title', 'Untitled')
+                    self.note_progress.emit(title)
+                    resources = self._extract_resources(note)
+                    processed_attachments = self._build_note_docx(note, resources, idx, notebook_name, notebook_dir)
+                    if processed_attachments:
+                        notebook_attachments_index[title] = processed_attachments
+                    count += 1
+                
+                if notebook_attachments_index:
+                    self.index_creation.emit(notebook_name)
+                    self._create_attachment_index_docx(notebook_dir, notebook_attachments_index, notebook_name)
+                
+                total_notes_processed += count
+                summary_data.append((notebook_name, count))
+            
+            # --- Final Summary ---
+            end_time = datetime.now()
+            num_errors = len(self.error_log)
+            error_status_short = ""
+
+            if num_errors > 0:
+                error_log_path = os.path.join(self.dest_dir, "Error_Log.txt")
+                with open(error_log_path, "w", encoding="utf-8") as f:
+                    f.write("Errors and Warnings during conversion:\n" + "="*40 + "\n")
+                    for entry in self.error_log:
+                        f.write(f"- {entry}\n")
+                error_status_short = f"Process completed with warnings/errors. See 'Error_Log.txt' for details."
+            else:
+                error_status_short = "Process completed successfully with no errors."
+
+            error_percentage = (num_errors / total_notes_processed * 100) if total_notes_processed > 0 else 0
+            error_summary_line = f"Errors Logged: {num_errors} ({error_percentage:.2f}% of notes)"
+            
+            # Create Summary Docx
+            summary_doc = Document()
+            summary_doc.add_heading("Conversion Summary", level=1)
+            p = summary_doc.add_paragraph(); p.add_run("Start Time: ").bold = True; p.add_run(start_time.strftime('%Y-%m-%d %H:%M:%S'))
+            p = summary_doc.add_paragraph(); p.add_run("End Time  : ").bold = True; p.add_run(end_time.strftime('%Y-%m-%d %H:%M:%S'))
+            p = summary_doc.add_paragraph(); p.add_run("Duration  : ").bold = True; p.add_run(str(end_time - start_time))
+            summary_doc.add_paragraph().add_run(error_status_short).italic = True
+            summary_doc.add_paragraph().add_run(error_summary_line).bold = True
+            summary_doc.add_heading(f"Notebooks Processed: {len(summary_data)}", level=2)
+            for name, count in summary_data:
+                summary_doc.add_paragraph(f"{name}: {count} notes", style='List Bullet')
+            summary_doc.add_heading("Totals", level=2)
+            total_p = summary_doc.add_paragraph(); total_p.add_run("Total Notes Converted: ").bold = True; total_p.add_run(str(total_notes_processed))
+            summary_path = os.path.join(self.dest_dir, "Summary.docx")
+            summary_doc.save(summary_path)
+
+            final_status = f"{total_notes_processed} notes converted. {num_errors} errors logged."
+            self.finished.emit(final_status)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+    # --- Backend Processing Logic (Copied from original, with minor adjustments) ---
+    def _sanitize_filename(self, filename):
+        if not filename: return ""
+        clean_name = filename.strip().replace('\n', '').replace('\r', '')
+        invalid_chars = '<>:\"/\\|?*;&='
+        for char in invalid_chars:
+            clean_name = clean_name.replace(char, '_')
+        return clean_name[:100]
+
+    def _parse_evernote_date(self, date_str):
+        if not date_str: return "N/A"
+        try:
+            dt = datetime.strptime(date_str, "%Y%m%dT%H%M%SZ")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return date_str
+
+    def _extract_resources(self, note_element):
+        resources = {}
+        for resource in note_element.findall("resource"):
+            data_element = resource.find("data")
+            if data_element is None or not data_element.text: continue
+            try:
+                decoded_data = base64.b64decode(data_element.text)
+                resource_hash = hashlib.md5(decoded_data).hexdigest()
+                mime = resource.findtext("mime", "application/octet-stream")
+                filename_element = resource.find("resource-attributes/file-name")
+                filename = filename_element.text if filename_element is not None else resource_hash
+                resources[resource_hash] = {"data": decoded_data, "mime": mime, "filename": filename}
+            except (ValueError, TypeError) as e:
+                self.error_log.append(f"Warning: Could not decode a resource. Error: {e}")
+        return resources
+    
+    def _add_hyperlink(self, paragraph, text, url):
+        part = paragraph.part
+        r_id = part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('r:id'), r_id)
+        new_run = OxmlElement('w:r')
+        rpr = OxmlElement('w:rPr')
+        c = OxmlElement('w:color'); c.set(qn('w:val'), '0000FF'); rpr.append(c)
+        u = OxmlElement('w:u'); u.set(qn('w:val'), 'single'); rpr.append(u)
+        new_run.append(rpr)
+        new_run.text = text
+        hyperlink.append(new_run)
+        paragraph._p.append(hyperlink)
+        return hyperlink
+
+    def _add_paragraph_with_links(self, doc, text):
+        p = doc.add_paragraph()
+        url_regex = re.compile(r'(https?://\S+)')
+        parts = url_regex.split(text)
+        for i, part in enumerate(parts):
+            if i % 2 == 1: # It's a URL
+                try:
+                    self._add_hyperlink(p, part, part)
+                except Exception:
+                    p.add_run(part) # Fallback if link creation fails
+            else:
+                p.add_run(part)
+
+    def _process_note_content(self, content_xml, resources, doc, media_dir):
+        processed_attachments = []
+        image_mime_types = {'image/jpeg', 'image/png', 'image/gif', 'image/bmp'}
+        indexable_doc_mimes = {'application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}
+
+        soup = BeautifulSoup(content_xml, 'xml')
+        for element in soup.find_all(True):
+            if element.name in ['div', 'p', 'li']:
+                self._add_paragraph_with_links(doc, element.get_text(strip=False))
+            elif element.name == 'br':
+                doc.add_paragraph()
+            elif element.name == 'hr':
+                doc.add_paragraph("-" * 70)
+            elif element.name == 'en-media':
+                media_hash = element.get('hash')
+                if media_hash in resources:
+                    resource = resources[media_hash]
+                    safe_filename = self._sanitize_filename(resource['filename'])
+                    if not safe_filename:
+                        ext = mimetypes.guess_extension(resource['mime']) or '.dat'
+                        safe_filename = f"{media_hash}{ext}"
+                    media_filepath = os.path.join(media_dir, safe_filename)
+                    
+                    try:
+                        with open(media_filepath, 'wb') as f: f.write(resource['data'])
+                    except OSError as e:
+                        self.error_log.append(f"Note '{doc.paragraphs[0].text}': OS Error writing file '{safe_filename}': {e}")
+                        continue
+                    
+                    attachment_info = {'filename': safe_filename, 'path': os.path.abspath(media_filepath)}
+                    file_url = urllib.parse.urljoin('file:', urllib.request.pathname2url(attachment_info['path']))
+
+                    if resource['mime'] in image_mime_types and HAS_PILLOW:
+                        try:
+                            img = Image.open(media_filepath)
+                            if img.mode == 'CMYK': img = img.convert('RGB')
+                            
+                            png_filepath = os.path.splitext(media_filepath)[0] + ".png"
+                            img.save(png_filepath, "PNG")
+                            
+                            doc.add_picture(png_filepath, width=Inches(5.0))
+                            p = doc.add_paragraph(style='Caption'); p.add_run('[Image file: ')
+                            png_url = urllib.parse.urljoin('file:', urllib.request.pathname2url(os.path.abspath(png_filepath)))
+                            self._add_hyperlink(p, os.path.basename(png_filepath), png_url)
+                            p.add_run(']')
+                        except (IOError, UnidentifiedImageError, SyntaxError):
+                            processed_attachments.append(attachment_info)
+                            p = doc.add_paragraph(style='Caption'); p.add_run('[Attached file (unreadable image): ')
+                            self._add_hyperlink(p, safe_filename, file_url)
+                            p.add_run(']')
+                    else:
+                        if resource['mime'] in indexable_doc_mimes:
+                            processed_attachments.append(attachment_info)
+                        p = doc.add_paragraph(style='Caption'); p.add_run('[Attached file: ')
+                        self._add_hyperlink(p, safe_filename, file_url)
+                        p.add_run(']')
+        return processed_attachments
+
+    def _build_note_docx(self, note, resources, note_num, notebook_name, notebook_dir):
+        title = note.findtext("title", "Untitled")
+        attachments_in_note = []
+        doc = Document()
+        doc.add_heading(f"Note #{note_num}: {title}", level=1)
+        try:
+            created = self._parse_evernote_date(note.findtext("created", ""))
+            updated = self._parse_evernote_date(note.findtext("updated", ""))
+            tags = [tag.text for tag in note.findall("tag")]
+            source = note.findtext("note-attributes/source")
+            source_url = note.findtext("note-attributes/source-url")
+
+            safe_title = self._sanitize_filename(title)
+            filename = f"{note_num:03d}_{safe_title}.docx"
+            filepath = os.path.join(notebook_dir, filename)
+
+            doc.add_paragraph(f"Notebook : {notebook_name}")
+            doc.add_paragraph(f"Created  : {created}")
+            doc.add_paragraph(f"Updated  : {updated}")
+            if tags: doc.add_paragraph(f"Tags     : {', '.join(tags)}")
+            if source: doc.add_paragraph(f"Source   : {source}")
+            if source_url:
+                p = doc.add_paragraph(); p.add_run("Source URL: "); self._add_hyperlink(p, source_url, source_url)
+            
+            doc.add_paragraph("-" * 70)
+            content = note.findtext("content")
+            if content:
+                media_dir = os.path.join(notebook_dir, MEDIA_FOLDER_NAME)
+                os.makedirs(media_dir, exist_ok=True)
+                attachments_in_note = self._process_note_content(content, resources, doc, media_dir)
+
+            doc.add_paragraph("-" * 70)
+            footer_para = doc.add_paragraph()
+            self._add_hyperlink(footer_para, "Created with Get Productive Fast's ENEXtoDOCX", self.quick_notes_suite_url)
+
+            doc.save(filepath)
+        except OSError as e:
+            self.error_log.append(f"Notebook '{notebook_name}': Could not create DOCX for note '{title}'. Error: {e}")
+        return attachments_in_note
+
+    def _create_attachment_index_docx(self, notebook_dir, index_data, notebook_name):
+        index_doc = Document()
+        index_doc.add_heading("Index of Attachments", level=1)
+        index_doc.add_heading("non-embeddable", level=2)
+        p = index_doc.add_paragraph(); p.add_run("Notebook: ").bold = True; p.add_run(notebook_name)
+        for note_title, attachments in sorted(index_data.items()):
+            p_title = index_doc.add_paragraph(); p_title.add_run(note_title).bold = True
+            for attachment in attachments:
+                file_url = urllib.parse.urljoin('file:', urllib.request.pathname2url(attachment['path']))
+                p_attach = index_doc.add_paragraph(style='List Bullet')
+                p_attach.paragraph_format.left_indent = Inches(0.5)
+                self._add_hyperlink(p_attach, attachment['filename'], file_url)
+        
+        index_filepath = os.path.join(notebook_dir, "Index of Attachments.docx")
+        index_doc.save(index_filepath)
+
+
+# --- Main Application Window ---
+class EnexToDocxApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        # --- Window Setup ---
+        self.setWindowTitle(APP_NAME)
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
+
+        self.setMinimumSize(550, 400)
+        self.resize(650, 400)
+        
+        # --- App Data and Settings ---
+        app_data_path = os.path.join(os.getenv('LOCALAPPDATA'), APP_NAME)
+        os.makedirs(app_data_path, exist_ok=True)
+        self.settings_path = os.path.join(app_data_path, 'settings.json')
+
+        # --- Class Variables ---
+        self.source_folder = ""
+        self.dest_folder = ""
+        self.notebook_options = ["All"]
+        self.quick_notes_suite_url = ""
+        self.conversion_thread = None
+        self.conversion_worker = None
+
+        # --- Create UI ---
+        self._create_menu()
+        self._create_widgets()
+        self._load_settings()
+        self._update_notebook_list()
+        self._center_window()
+
+    # --- GUI Creation Methods ---
+    def _create_menu(self):
+        menubar = self.menuBar()
+        
+        # File Menu
+        file_menu = menubar.addMenu("&File")
+        
+        source_action = QAction("&Select Source Folder...", self)
+        source_action.triggered.connect(self._browse_source_folder)
+        file_menu.addAction(source_action)
+
+        dest_action = QAction("Select &Destination Folder...", self)
+        dest_action.triggered.connect(self._browse_dest_folder)
+        file_menu.addAction(dest_action)
+        
+        file_menu.addSeparator()
+        
+        go_action = QAction("&Go", self)
+        go_action.setShortcut("Ctrl+G")
+        go_action.triggered.connect(self._start_conversion)
+        file_menu.addAction(go_action)
+        
+        file_menu.addSeparator()
+
+        close_action = QAction("&Close", self)
+        close_action.triggered.connect(self.close)
+        file_menu.addAction(close_action)
+
+        # Help Menu
+        help_menu = menubar.addMenu("&Help")
+        
+        doc_action = QAction("&Documentation", self)
+        doc_action.triggered.connect(self._show_documentation)
+        help_menu.addAction(doc_action)
+
+
+
+        about_app_action = QAction(f"About {APP_NAME}", self)
+        about_app_action.triggered.connect(self._show_about_dialog)
+        help_menu.addAction(about_app_action)
+
+    def _create_widgets(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Info Text
+        info_text = (
+            f"<b>{APP_NAME}</b> converts Evernote export files (.enex) to Word format (.docx). "
+            "These can then be imported into Google Drive and each will become a Doc file."
+        )
+        self.info_label = QLabel(info_text)
+        self.info_label.setWordWrap(True)
+        self.info_label.setOpenExternalLinks(True)
+        main_layout.addWidget(self.info_label)
+        main_layout.addSpacing(15)
+
+        # Grid for inputs
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(10)
+        
+        # Source Folder
+        grid_layout.addWidget(QLabel("Source ENEX Folder:"), 0, 0)
+        self.source_entry = QLineEdit()
+        grid_layout.addWidget(self.source_entry, 0, 1)
+        self.source_button = QPushButton("Browse...")
+        self.source_button.clicked.connect(self._browse_source_folder)
+        grid_layout.addWidget(self.source_button, 0, 2)
+
+        # Destination Folder
+        grid_layout.addWidget(QLabel("Destination Folder:"), 1, 0)
+        self.dest_entry = QLineEdit()
+        grid_layout.addWidget(self.dest_entry, 1, 1)
+        self.dest_button = QPushButton("Browse...")
+        self.dest_button.clicked.connect(self._browse_dest_folder)
+        grid_layout.addWidget(self.dest_button, 1, 2)
+
+        # Notebook Dropdown
+        grid_layout.addWidget(QLabel("Notebook to Process:"), 2, 0)
+        self.notebook_dropdown = QComboBox()
+        self.notebook_dropdown.addItems(self.notebook_options)
+        grid_layout.addWidget(self.notebook_dropdown, 2, 1, 1, 2)
+
+        grid_layout.setColumnStretch(1, 1)
+        main_layout.addLayout(grid_layout)
+        
+        main_layout.addSpacing(15)
+
+        # Progress Section
+        self.notebook_status_label = QLabel("")
+        main_layout.addWidget(self.notebook_status_label)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        main_layout.addWidget(self.progress_bar)
+
+        self.note_status_label = QLabel("")
+        main_layout.addWidget(self.note_status_label)
+
+        main_layout.addStretch()
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        self.go_button = QPushButton("Go")
+        self.go_button.clicked.connect(self._start_conversion)
+        button_layout.addWidget(self.go_button)
+        self.cancel_button = QPushButton("Close")
+        self.cancel_button.clicked.connect(self.close)
+        button_layout.addWidget(self.cancel_button)
+        main_layout.addLayout(button_layout)
+    
+    def _center_window(self):
+        screen = self.screen().geometry()
+        self.move(screen.center() - self.frameGeometry().center())
+
+    # --- GUI Functionality Methods ---
+    def _toggle_controls(self, enabled):
+        for widget in [self.source_entry, self.dest_entry, self.source_button, 
+                       self.dest_button, self.notebook_dropdown, self.go_button]:
+            widget.setEnabled(enabled)
+
+    def _browse_source_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "Select the Source ENEX Folder", self.source_folder)
+        if folder_path:
+            self.source_folder = folder_path
+            self.source_entry.setText(folder_path)
+            self._update_notebook_list()
+
+    def _browse_dest_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "Select the Destination Folder", self.dest_folder)
+        if folder_path:
+            self.dest_folder = folder_path
+            self.dest_entry.setText(folder_path)
+
+    def _update_notebook_list(self):
+        if not os.path.isdir(self.source_folder):
+            self.notebook_options = ["All"]
+        else:
+            try:
+                files = os.listdir(self.source_folder)
+                enex_files = [os.path.splitext(f)[0] for f in files if f.endswith(".enex")]
+                self.notebook_options = ["All"] + sorted(enex_files)
+            except OSError:
+                self.notebook_options = ["All"]
+        
+        self.notebook_dropdown.clear()
+        self.notebook_dropdown.addItems(self.notebook_options)
+        self.notebook_dropdown.setCurrentText("All")
+
+    def _load_settings(self):
+        try:
+            if os.path.exists(self.settings_path):
+                with open(self.settings_path, 'r') as f:
+                    settings = json.load(f)
+                    self.source_folder = settings.get('source', '')
+                    self.dest_folder = settings.get('dest', '')
+                    self.source_entry.setText(self.source_folder)
+                    self.dest_entry.setText(self.dest_folder)
+                    
+                    self._update_notebook_list() # Update list before setting value
+                    notebook_to_set = settings.get('notebook', 'All')
+                    if notebook_to_set in self.notebook_options:
+                        self.notebook_dropdown.setCurrentText(notebook_to_set)
+
+        except (json.JSONDecodeError, IOError):
+            pass # Ignore errors on loading settings
+
+    def _save_settings(self):
+        settings = {
+            'source': self.source_entry.text(),
+            'dest': self.dest_entry.text(),
+            'notebook': self.notebook_dropdown.currentText()
+        }
+        try:
+            with open(self.settings_path, 'w') as f:
+                json.dump(settings, f, indent=4)
+        except IOError as e:
+            QMessageBox.warning(self, "Warning", f"Could not save settings: {e}")
+
+    def _show_documentation(self):
+        if APP_DOCUMENTATION_LINK:
+            webbrowser.open_new(APP_DOCUMENTATION_LINK)
+        else:
+            QMessageBox.information(self, "Documentation", 
+                                    "Documentation is not yet available for this application.")
+
+    def _show_about_dialog(self):
+        """Displays the application's About box."""
+        about_text = f"""
+        <b>{APP_NAME}</b><br>
+        Version {APP_VERSION}<br>
+        {APP_COPYRIGHT}<br><br>
+        This application converts Evernote Export files (.enex) 
+        into Microsoft Word (.docx) format.<br><br>
+        It is designed to work with the 
+        <a href='{self.quick_notes_suite_url}'>Quick Notes Suite</a> project.
+        """
+        QMessageBox.about(self, f"About {APP_NAME}", about_text)
+
+    def _start_conversion(self):
+        source = self.source_entry.text()
+        dest = self.dest_entry.text()
+        
+        if not source or not dest:
+            QMessageBox.critical(self, "Error", "Please select both a source and a destination folder.")
+            return
+
+        self._toggle_controls(False)
+        self._save_settings()
+        
+        self.progress_bar.setValue(0)
+        self.notebook_status_label.setText("Starting conversion...")
+        self.note_status_label.setText("")
+
+        notebook = self.notebook_dropdown.currentText()
+        if notebook == "All":
+            notebook = None
+
+        # Setup and start the thread
+        self.conversion_thread = QThread()
+        self.conversion_worker = ConversionWorker(source, dest, notebook, self.quick_notes_suite_url)
+        self.conversion_worker.moveToThread(self.conversion_thread)
+        
+        # Connect signals
+        self.conversion_thread.started.connect(self.conversion_worker.run)
+        self.conversion_worker.finished.connect(self._on_conversion_finished)
+        self.conversion_worker.error.connect(self._on_conversion_error)
+        
+        self.conversion_worker.notebook_start.connect(self.on_notebook_start)
+        self.conversion_worker.note_progress.connect(self.on_note_progress)
+        self.conversion_worker.index_creation.connect(self.on_index_creation)
+
+        self.conversion_thread.start()
+
+    # --- Worker Signal Handlers (Slots) ---
+    def on_notebook_start(self, name, total_notes):
+        self.notebook_status_label.setText(f"Processing Notebook: {name}...")
+        self.progress_bar.setMaximum(total_notes)
+        self.progress_bar.setValue(0)
+
+    def on_note_progress(self, title):
+        self.note_status_label.setText(f"Processing Note: {title[:70]}...")
+        self.progress_bar.setValue(self.progress_bar.value() + 1)
+        
+    def on_index_creation(self, name):
+        self.note_status_label.setText(f"Creating attachment index for {name}...")
+
+    def _on_conversion_finished(self, final_status):
+        self._toggle_controls(True)
+        self.notebook_status_label.setText("Conversion Complete!")
+        self.note_status_label.setText(final_status)
+        QMessageBox.information(self, "Success", f"Conversion process finished.\n{final_status}")
+        self._cleanup_thread()
+
+    def _on_conversion_error(self, error_message):
+        self._toggle_controls(True)
+        self.notebook_status_label.setText("Conversion Failed!")
+        self.note_status_label.setText(f"Error: {error_message}")
+        QMessageBox.critical(self, "Error", f"An unexpected error occurred:\n{error_message}")
+        self._cleanup_thread()
+
+    def _cleanup_thread(self):
+        if self.conversion_thread is not None and self.conversion_thread.isRunning():
+            self.conversion_thread.quit()
+            self.conversion_thread.wait()
+        self.conversion_thread = None
+        self.conversion_worker = None
+
+    def closeEvent(self, event):
+        """Ensure thread is cleaned up on window close."""
+        self._save_settings()
+        self._cleanup_thread()
+        event.accept()
+
+# --- License Dialog Function ---
+def show_license_dialog():
+    """Displays a one-time license agreement dialog."""
+    
+    MIT_LICENSE_TEXT = f"""
+MIT License
+
+{APP_COPYRIGHT}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+    msg_box = QMessageBox()
+    msg_box.setIcon(QMessageBox.Information)
+    msg_box.setWindowTitle("License Agreement")
+    if os.path.exists(ICON_PATH):
+        msg_box.setWindowIcon(QIcon(ICON_PATH))
+
+    msg_box.setText("Please accept the MIT License to use this software.")
+    msg_box.setInformativeText(
+        "This is a one-time agreement. Accepting will allow the application "
+        "to create a settings file, and this dialog will not be shown again."
+    )
+    msg_box.setDetailedText(MIT_LICENSE_TEXT)
+    
+    accept_button = msg_box.addButton("Agree", QMessageBox.AcceptRole)
+    decline_button = msg_box.addButton("Disagree", QMessageBox.RejectRole)
+    msg_box.setDefaultButton(decline_button)
+    
+    msg_box.exec()
+    
+    return msg_box.clickedButton() == accept_button
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    if os.path.exists(ICON_PATH):
+        app.setWindowIcon(QIcon(ICON_PATH))
+    
+    if not HAS_PILLOW:
+        QMessageBox.critical(
+            None, 
+            "Dependency Error", 
+            "The 'Pillow' library is required.\nPlease install it: pip install Pillow"
+        )
+        sys.exit(1) # Exit if dependency is missing
+
+    # --- License Check before starting the app ---
+    app_data_path = os.path.join(os.getenv('LOCALAPPDATA'), APP_NAME)
+    settings_path = os.path.join(app_data_path, 'settings.json')
+
+    # If settings file doesn't exist, this is likely the first run
+    if not os.path.exists(settings_path):
+        accepted = show_license_dialog()
+        if not accepted:
+            sys.exit(0) # Exit cleanly if user declines
+
+    window = EnexToDocxApp()
+    window.show()
+    sys.exit(app.exec())
